@@ -1,0 +1,277 @@
+description: This runbook attempts to restart an AWS Resources that caused an incident.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.
+    default: 'arn:aws:iam::123456789012:role/service-role/im-serv-role-runbook-assume-role'
+  IncidentRecordArn:
+    type: String
+    description: The incident
+mainSteps:
+  # Get
+  - name: ListTimelineEvents
+    action: 'aws:executeAwsApi'
+    outputs:
+      - Selector: '$.eventSummaries[0].eventId'
+        Name: eventId
+        Type: String
+    inputs:
+      Service: ssm-incidents
+      Api: ListTimelineEvents
+      incidentRecordArn: '{{IncidentRecordArn}}'
+      filters:
+        - key: eventType
+          condition:
+            equals:
+              stringValues:
+                - SSM Incident Trigger
+    description: This step retrieves the ID of the first timeline event with the CloudWatch alarm details.
+    nextStep: GetTimelineEvent
+  - name: GetTimelineEvent
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ssm-incidents
+      Api: GetTimelineEvent
+      incidentRecordArn: '{{IncidentRecordArn}}'
+      eventId: '{{ListTimelineEvents.eventId}}'
+    outputs:
+      - Name: eventData
+        Selector: $.event.eventData
+        Type: String
+    description: This step retrieves the timeline event itself.
+    nextStep: JsonDecode
+  - name: JsonDecode
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.6
+      Handler: script_handler
+      Script: |-
+        import json
+
+        def script_handler(events, context):
+          data = json.loads(events["eventData"])
+          return data
+      InputPayload:
+        eventData: '{{GetTimelineEvent.eventData}}'
+    outputs:
+      - Name: rawData
+        Selector: $.Payload.rawData
+        Type: String
+    description: This step parses the timeline event data.
+    nextStep: GetCWAlarm
+  - name: GetCWAlarm
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.6
+      Handler: script_handler
+      Script: |-
+        import json
+
+        def script_handler(events, context):
+          data = json.loads(events["rawData"])
+          return data
+      InputPayload:
+        rawData: '{{JsonDecode.rawData}}'
+    outputs:
+      - Name: Namespace
+        Selector: '$.Payload.detail.configuration.metrics[0].metricStat.metric.namespace'
+        Type: String
+      - Name: MetricName
+        Selector: '$.Payload.detail.configuration.metrics[0].metricStat.metric.name'
+        Type: String
+      - Name: Dimensions
+        Selector: '$.Payload.detail.configuration.metrics[0].metricStat.metric.dimensions'
+        Type: StringMap
+    description: This step parses the CloudWatch event data.
+    nextStep: ChooseIncidentType
+  
+  # Choose
+  - name: ChooseIncidentType
+    action: 'aws:branch'
+    inputs:
+      Choices:
+        - NextStep: GetEC2Dimensions
+          Variable: '{{GetCWAlarm.Namespace}}'
+          StringEquals: AWS/EC2
+        - NextStep: GetCWADimensions
+          Variable: '{{GetCWAlarm.Namespace}}'
+          StringEquals: CWAgent
+    description: Choose rescue action from Namespace
+  - name: GetEC2Dimensions
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.6
+      Handler: script_handler
+      Script: |-
+        import json
+
+        def script_handler(events, context):
+          # data = json.loads(events["Dimensions"])
+          print(events)
+          data = events["Dimensions"]
+          print(data)
+          return data
+      InputPayload:
+        Dimensions: '{{GetCWAlarm.Dimensions}}'
+    outputs:
+      - Name: InstanceId
+        Selector: $.Payload.InstanceId
+        Type: String
+    nextStep: ChooseEC2Metric
+  - name: GetCWADimensions
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.6
+      Handler: script_handler
+      Script: |-
+        import json
+
+        def script_handler(events, context):
+          # data = json.loads(events["Dimensions"])
+          data = events["Dimensions"]
+          print(data)
+          return data
+      InputPayload:
+        Dimensions: '{{GetCWAlarm.Dimensions}}'
+    outputs:
+      - Name: ProcessName
+        Selector: $.Payload.exe
+        Type: String
+      - Name: InstanceId
+        Selector: $.Payload.InstanceId
+        Type: String
+    nextStep: ChooseCWAMetric
+  - name: ChooseEC2Metric
+    action: 'aws:branch'
+    inputs:
+      Choices:
+        - NextStep: CheckVmstatCommand
+          Variable: '{{GetCWAlarm.MetricName}}'
+          StringEquals: CPUUtilization
+        - NextStep: RebootInstance
+          Variable: '{{GetCWAlarm.MetricName}}'
+          StringEquals: StatusCheckFailed_Instance
+  - name: ChooseCWAMetric
+    action: 'aws:branch'
+    inputs:
+      Choices:
+        - NextStep: RestartProcess
+          Variable: '{{GetCWAlarm.MetricName}}'
+          StringEquals: procstat_lookup_pid_count
+  
+  # Action
+  - name: CheckVmstatCommand
+    action: 'aws:runCommand'
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{GetEC2Dimensions.InstanceId}}'
+      Parameters:
+        commands:
+          - vmstat
+    isEnd: true
+  
+  - name: RebootInstance
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ec2
+      Api: RebootInstances
+      InstanceIds:
+        - '{{GetEC2Dimensions.InstanceId}}'
+    outputs:
+      - Name: ResultRebootInstance
+        Selector: $
+        Type: StringMap
+    nextStep: SleepReboot
+  - name: SleepReboot
+    action: 'aws:sleep'
+    inputs:
+      Duration: PT5M
+    nextStep: CheckEC2Status
+  - name: CheckEC2Status
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ec2
+      Api: DescribeInstanceStatus
+      InstanceIds:
+        - '{{GetEC2Dimensions.InstanceId}}'
+    outputs:
+      - Name: ResultEC2Status
+        Selector: '$.InstanceStatuses[0].InstanceStatus.Status'
+        Type: String
+  - name: BranchInstanceStatus
+    action: 'aws:branch'
+    inputs:
+      Choices:
+        - NextStep: ResolveIncidentRecord
+          Variable: '{{CheckEC2Status.ResultEC2Status}}'
+          StringEquals: ok
+        - NextStep: GetDescribeInstance
+          Not:
+            Variable: '{{CheckEC2Status.ResultEC2Status}}'
+            StringEquals: ok
+  - name: GetDescribeInstance
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ec2
+      Api: DescribeInstanceStatus
+      InstanceIds:
+        - '{{GetEC2Dimensions.InstanceId}}'
+    outputs:
+      - Name: ResultEC2Status
+        Selector: $
+        Type: String
+    isEnd: true
+  - name: RestartProcess
+    action: 'aws:runCommand'
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{GetCWADimensions.InstanceId}}'
+      Parameters:
+        commands: 'systemctl restart {{GetCWADimensions.ProcessName}}'
+    nextStep: SleepProcessRestarted
+  - name: SleepProcessRestarted
+    action: 'aws:sleep'
+    inputs:
+      Duration: PT1M
+    nextStep: CheckProccessCount
+  - name: CheckProccessCount
+    action: 'aws:runCommand'
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{GetCWADimensions.InstanceId}}'
+      Parameters:
+        commands: 'ps aux | grep {{GetCWADimensions.ProcessName}} | grep -v grep | wc -l'
+    nextStep: BranchProccessCount
+  - name: BranchProccessCount
+    action: 'aws:branch'
+    inputs:
+      Choices:
+        - NextStep: ResolveIncidentRecord
+          Not:
+            Variable: '{{CheckProccessCount.Output}}'
+            StringEquals: '0'
+        - NextStep: GetStatusProcess
+          Variable: '{{CheckProccessCount.Output}}'
+          StringEquals: '0'
+  - name: GetStatusProcess
+    action: 'aws:runCommand'
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{GetInstanceId.InstanceId}}'
+      Parameters:
+        commands: 'systemctl status {{GetCWADimensions.ProcessName}}'
+    isEnd: true
+  - name: ResolveIncidentRecord
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ssm-incidents
+      Api: UpdateIncidentRecord
+      arn: '{{IncidentRecordArn}}'
+      status: RESOLVED
+    isEnd: true
